@@ -33,9 +33,9 @@ function escapeAll(s) {
 
 // Escape HTML-special characters but leave an ampersand alone when it
 // begins something shaped like a character reference (used for text).
-const BARE_AMP = /&(?!(?:#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
+const ESCAPABLE_TEXT = /[<>"']|&(?!(?:#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
 function escapeText(s) {
-  if (!/[<>"']/.test(s) && !BARE_AMP.test(s)) return s;
+  if (!ESCAPABLE_TEXT.test(s)) return s;
   return s.replace(/[<>"']|&(?!(?:#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g, escapeChar);
 }
 
@@ -46,7 +46,7 @@ function escapeText(s) {
 const NUMERIC_REF = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
 const NUMERIC_REF_OR_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(?:#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 function decodeNumericRefs(s) {
-  if (!NUMERIC_REF.test(s)) return s;
+  if (!s.includes('&#') || !NUMERIC_REF.test(s)) return s;
   return s.replace(NUMERIC_REF_OR_AMP, (m, dec, hex) => {
     if (dec === undefined && hex === undefined) return '&amp;';
     const cp = dec === undefined ? parseInt(hex, 16) : parseInt(dec, 10);
@@ -326,6 +326,20 @@ function unescapePunct(s) {
   return s.replace(INL.anyPunctuation, '$1');
 }
 
+// Index of the first non-whitespace character of `s`, or -1. ASCII
+// whitespace is checked inline; a non-ASCII character defers to the
+// regex so Unicode spaces are classified exactly.
+function firstNonSpaceIdx(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13) continue;
+    if (c < 128) return i;
+    const rest = s.slice(i).search(/\S/);
+    return rest === -1 ? -1 : i + rest;
+  }
+  return -1;
+}
+
 function htmlBeginPattern(indent) {
   return new RegExp(
     String.raw`^ {0,${indent}}(?:</?(?:${BLOCK_TAGS})(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\s>]|$)|!--)|<\?|<![A-Za-z]|<!\[CDATA\[)`,
@@ -403,15 +417,18 @@ function splitCells(s, count) {
 }
 
 // A table can only start when the second line is a delimiter row: only
-// pipes, colons, dashes and spaces, with at least one dash and at least
-// one pipe or colon. This cheap test keeps the full table pattern from
-// running at most block starts.
-function tableMayStart(src) {
+// pipes, colons, dashes and spaces, with at least one dash. (The table
+// tokenizer itself additionally demands a pipe or colon in the row, but
+// the table *pattern* embedded in the paragraph rule does not, so a
+// pure-dash row still interrupts a paragraph; `forParagraph` selects
+// which of the two cheap tests applies.)
+function tableMayStart(src, forParagraph = false) {
   const firstNl = src.indexOf('\n');
   if (firstNl === -1) return false;
   const secondEnd = src.indexOf('\n', firstNl + 1);
   const line2 = secondEnd === -1 ? src.slice(firstNl + 1) : src.slice(firstNl + 1, secondEnd);
-  return /^[|:\- ]+$/.test(line2) && line2.includes('-') && /[:|]/.test(line2);
+  if (!/^[|:\- ]+$/.test(line2) || !line2.includes('-')) return false;
+  return forParagraph || /[:|]/.test(line2);
 }
 
 // A setext heading needs an underline line (`=` or `-` run) somewhere in
@@ -491,7 +508,7 @@ function lexParagraph(src) {
     ) {
       break;
     }
-    if (tableMayStart(src.slice(pos)) && RE.table.exec(src.slice(pos)) !== null) break;
+    if (tableMayStart(src.slice(pos), true) && RE.table.exec(src.slice(pos)) !== null) break;
     consumed = end === -1 ? src.length : end;
     if (end === -1) break;
     pos = end + 1;
@@ -525,10 +542,12 @@ function lexBlocks(src, ctx, out, mergePara) {
     }
 
     // Indented code; absorbed into a preceding paragraph or text token.
+    // (Advance only past the trimmed raw: trailing blank lines belong
+    // to the following space token, which list looseness inspects.)
     if ((c0 === 32 || c0 === 9) && (m = RE.indentedCode.exec(src)) !== null) {
       const raw = trimTrailingBlankLines(m[0]);
       const text = raw.replace(RE.codeStripIndent, '');
-      src = src.slice(m[0].length);
+      src = src.slice(raw.length);
       if (last !== undefined && (last.t === 'paragraph' || last.t === 'text')) {
         last.raw += (last.raw.endsWith('\n') ? '' : '\n') + raw;
         last.text += '\n' + text;
@@ -554,20 +573,22 @@ function lexBlocks(src, ctx, out, mergePara) {
 
     // ATX heading.
     if (lead === '#' && (m = RE.atxHeading.exec(src)) !== null) {
-      src = src.slice(m[0].length);
+      const raw = stripTrailing(m[0], '\n');
+      src = src.slice(raw.length);
       let text = m[2].trim();
       if (RE.trailingHashes.test(text)) {
         const stripped = stripTrailing(text, '#');
         if (stripped === '' || RE.trailingSpaceTab.test(stripped)) text = stripped.trim();
       }
-      out.push({ t: 'heading', raw: stripTrailing(m[0], '\n'), depth: m[1].length, text });
+      out.push({ t: 'heading', raw, depth: m[1].length, text });
       continue;
     }
 
     // Thematic break.
     if ((lead === '-' || lead === '*' || lead === '_') && (m = RE.hr.exec(src)) !== null) {
-      src = src.slice(m[0].length);
-      out.push({ t: 'hr', raw: stripTrailing(m[0], '\n') });
+      const raw = stripTrailing(m[0], '\n');
+      src = src.slice(raw.length);
+      out.push({ t: 'hr', raw });
       continue;
     }
 
@@ -591,8 +612,8 @@ function lexBlocks(src, ctx, out, mergePara) {
 
     // Raw HTML block.
     if (lead === '<' && (m = RE.htmlBlock.exec(src)) !== null) {
-      src = src.slice(m[0].length);
       const raw = trimTrailingBlankLines(m[0]);
+      src = src.slice(raw.length);
       out.push({ t: 'html', raw, text: raw, pre: m[1] === 'pre' || m[1] === 'script' || m[1] === 'style' });
       continue;
     }
@@ -603,10 +624,11 @@ function lexBlocks(src, ctx, out, mergePara) {
       if (m[2].charAt(0) !== '<' && parenBalance(m[2]) !== -1) {
         // Unbalanced parentheses in the destination: not a definition.
       } else {
-        src = src.slice(m[0].length);
+        const defRaw = stripTrailing(m[0], '\n');
+        src = src.slice(defRaw.length);
         const tok = {
           t: 'def',
-          raw: stripTrailing(m[0], '\n'),
+          raw: defRaw,
           tag: normaliseLabel(m[1]),
           href: m[2] ? unescapePunct(m[2].replace(RE.angleHref, '$1')) : '',
           title: m[3] ? unescapePunct(m[3].substring(1, m[3].length - 1)) : undefined,
@@ -637,10 +659,11 @@ function lexBlocks(src, ctx, out, mergePara) {
 
     // Setext heading.
     if (setextPossible(src) && (m = RE.setext.exec(src)) !== null) {
-      src = src.slice(m[0].length);
+      const raw = stripTrailing(m[0], '\n');
+      src = src.slice(raw.length);
       out.push({
         t: 'heading',
-        raw: stripTrailing(m[0], '\n'),
+        raw,
         depth: m[2].charAt(0) === '=' ? 1 : 2,
         text: m[1].trim(),
       });
@@ -778,17 +801,19 @@ function lexList(src, ctx) {
     const itemStart = pos;
     pos += im[0].length;
     const bulletLen = im[1].length;
-    const firstContent = (im[2].endsWith('\n') ? im[2].slice(0, -1) : im[2]).replace(/^[ \t]+/, (v) =>
-      expandTabs(v, bulletLen),
-    );
-    const isBlank = !firstContent.trim();
+    const rawFirst = im[2].endsWith('\n') ? im[2].slice(0, -1) : im[2];
+    const fc0 = rawFirst.charCodeAt(0);
+    const firstContent =
+      fc0 === 32 || fc0 === 9 ? rawFirst.replace(/^[ \t]+/, (v) => expandTabs(v, bulletLen)) : rawFirst;
+    const firstNs = firstNonSpaceIdx(firstContent);
+    const isBlank = firstNs === -1;
     let indent;
     let text;
     if (isBlank) {
       indent = bulletLen + 1;
       text = '';
     } else {
-      let r = firstContent.search(RE.nonSpace);
+      let r = firstNs;
       if (r > 4) r = 1;
       text = firstContent.slice(r);
       indent = r + bulletLen;
@@ -832,14 +857,15 @@ function lexList(src, ctx) {
         ) {
           break;
         }
-        if (expanded.search(RE.nonSpace) >= indent || !line.trim()) {
+        const expNs = firstNonSpaceIdx(expanded);
+        if (expNs >= indent || expNs === -1) {
           text += '\n' + expanded.slice(indent);
         } else {
           // A lazy continuation line, unless the previous line was blank,
           // deeply indented, or itself the start of another block.
           if (
             prevBlank ||
-            prevContent.replace(/\t/g, '    ').search(RE.nonSpace) >= 4 ||
+            firstNonSpaceIdx(prevContent.replace(/\t/g, '    ')) >= 4 ||
             fencesRe.test(prevContent) ||
             headingRe.test(prevContent) ||
             htmlRe.test(prevContent) ||
@@ -853,7 +879,7 @@ function lexList(src, ctx) {
           }
           text += '\n' + add;
         }
-        prevBlank = !line.trim();
+        prevBlank = expNs === -1;
         pos += line.length + 1;
         prevContent = expanded.slice(indent);
       }
@@ -1028,6 +1054,23 @@ function maskInline(ctx, src) {
 // Try to read an emphasis or strong token at the head of `src`, where
 // `maskedFull` is the masked form of the whole inline string this call is
 // working on and `prevChar` is the last character of the preceding text.
+// The code point ending at index `end` of `s`, as a string ('' at 0).
+function prevCodePoint(s, end) {
+  if (end <= 0) return '';
+  const cu = s.charCodeAt(end - 1);
+  if (cu >= 0xDC00 && cu <= 0xDFFF && end >= 2) {
+    const hi = s.charCodeAt(end - 2);
+    if (hi >= 0xD800 && hi <= 0xDBFF) return s.slice(end - 2, end);
+  }
+  return s.charAt(end - 1);
+}
+
+// Length in code units of the first code point of `s`.
+function firstCodePointLen(s) {
+  const cu = s.charCodeAt(0);
+  return cu >= 0xD800 && cu <= 0xDBFF && s.length > 1 ? 2 : 1;
+}
+
 function emStrong(ctx, src, maskedFull, prevChar, closers) {
   const open = INL.emLDelim.exec(src);
   if (open === null || (!open[1] && !open[2] && !open[3] && !open[4])) return undefined;
@@ -1037,8 +1080,8 @@ function emStrong(ctx, src, maskedFull, prevChar, closers) {
   const remainLen = src.length;
   let runStart = fullLen - remainLen;
   const scanFrom = runStart;
-  while (!ctx.gfmPedantic && runStart > 0 && maskedFull[runStart - 1] === delim) runStart--;
-  const charBeforeRun = [...maskedFull.slice(Math.max(0, runStart - 2), runStart)].at(-1) ?? '';
+  while (runStart > 0 && maskedFull[runStart - 1] === delim) runStart--;
+  const charBeforeRun = prevCodePoint(maskedFull, runStart);
   const beforeIsDelimOrPunct =
     charBeforeRun === '*' || charBeforeRun === '_' || !!INL.punctuation.exec(charBeforeRun);
   let prev = prevChar;
@@ -1047,7 +1090,8 @@ function emStrong(ctx, src, maskedFull, prevChar, closers) {
   const punctAfter = open[1] || open[3] || '';
   if (open[4] && INL.unicodeAlnum.test(prev)) return undefined;
   if (!punctAfter || !prev || prevIsPunct) {
-    const runLen = [...open[0]].length - 1;
+    let runLen = 0;
+    while (open[0].charAt(runLen) === delim) runLen++;
     let need = runLen;
     let surplus = 0;
     const posInFull = fullLen - remainLen + runLen;
@@ -1063,7 +1107,7 @@ function emStrong(ctx, src, maskedFull, prevChar, closers) {
     while ((cm = rdelim.exec(rest)) !== null && cm.index <= lastOffset) {
       const grp = cm[1] || cm[2] || cm[3] || cm[4] || cm[5] || cm[6];
       if (!grp) continue;
-      const glen = [...grp].length;
+      const glen = grp.length;
       if (cm[3] || cm[4]) {
         need += glen;
         continue;
@@ -1080,7 +1124,7 @@ function emStrong(ctx, src, maskedFull, prevChar, closers) {
       need -= glen;
       if (need > 0) continue;
       const use = Math.min(glen, glen + need + surplus);
-      const firstCharLen = [...cm[0]][0].length;
+      const firstCharLen = firstCodePointLen(cm[0]);
       const raw = src.slice(0, runLen + cm.index + firstCharLen + use);
       if (Math.min(runLen, use) % 2) {
         const inner = raw.slice(1, -1);
@@ -1097,7 +1141,8 @@ function delSpan(ctx, src, maskedFull, prevChar, closers) {
   const open = INL.delLDelim.exec(src);
   if (open === null) return undefined;
   if (!open[1] || !prevChar || INL.punctuation.exec(prevChar)) {
-    const runLen = [...open[0]].length - 1;
+    let runLen = 0;
+    while (open[0].charAt(runLen) === '~') runLen++;
     let need = runLen;
     const posInFull = maskedFull.length - src.length + runLen;
     if (closers.lastDel < posInFull) return undefined;
@@ -1108,7 +1153,7 @@ function delSpan(ctx, src, maskedFull, prevChar, closers) {
     while ((cm = INL.delRDelim.exec(rest)) !== null && cm.index <= lastOffset) {
       const grp = cm[1] || cm[2] || cm[3] || cm[4] || cm[5] || cm[6];
       if (!grp) continue;
-      let glen = [...grp].length;
+      let glen = grp.length;
       if (glen !== runLen) continue;
       if (cm[3] || cm[4]) {
         need += glen;
@@ -1117,7 +1162,7 @@ function delSpan(ctx, src, maskedFull, prevChar, closers) {
       need -= glen;
       if (need > 0) continue;
       glen = Math.min(glen, glen + need);
-      const firstCharLen = [...cm[0]][0].length;
+      const firstCharLen = firstCodePointLen(cm[0]);
       const raw = src.slice(0, runLen + cm.index + firstCharLen + glen);
       const inner = raw.slice(runLen, raw.length - runLen);
       return { t: 'del', raw, text: inner };
@@ -1362,7 +1407,12 @@ function inlineHtml(src, ctx, st, textOnly) {
     }
 
     // GFM extended autolink (bare URL or email), outside links only.
-    if (!st.inLink && URL_START.test(rest) && (m = INL.url.exec(rest)) !== null) {
+    if (
+      !st.inLink &&
+      ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 46 || c === 95 || c === 43 || c === 45) &&
+      URL_START.test(rest) &&
+      (m = INL.url.exec(rest)) !== null
+    ) {
       let text;
       let href;
       if (m[2] === '@') {
